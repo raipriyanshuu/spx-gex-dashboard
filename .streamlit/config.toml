@@ -1,0 +1,25 @@
+# Local-only settings. Streamlit reads this when you run `streamlit run app.py`
+# from this folder.
+
+[server]
+# Bind to your own machine only - not reachable from other devices on your network.
+address = "localhost"
+port = 8502
+
+
+[browser]
+# Turn off Streamlit's anonymous usage statistics (the only other outbound call it makes).
+gatherUsageStats = false
+serverAddress = "localhost"
+
+[client]
+# Hide the 'Deploy' button - this app is meant to stay on your machine.
+toolbarMode = "minimal"
+
+[theme]
+base = "dark"
+primaryColor = "#22d3ee"
+backgroundColor = "#0b0f17"
+secondaryBackgroundColor = "#131a26"
+textColor = "#e6edf3"
+font = "sans serif"

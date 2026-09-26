@@ -1,0 +1,8 @@
+# Tested with Python 3.11 - 3.13
+streamlit==1.64.0
+plotly==7.1.0
+pandas==3.0.2
+numpy==2.4.4
+scipy==1.17.1
+requests==2.33.1
+tzdata==2026.4

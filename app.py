@@ -15,8 +15,10 @@ import streamlit as st
 
 import config
 import data_fetcher
+import exposures as exp_mod
 import gex_calculator as gc
 import visualizer as viz
+import vol_metrics as vm
 
 st.set_page_config(page_title="SPX Gamma Exposure", page_icon="📊", layout="wide")
 
@@ -31,6 +33,11 @@ NOT_A_FORECAST = (
     "GEX describes current (assumed) dealer positioning. It is not a price forecast; the "
     "link between dealer hedging and short-term SPX behaviour is a historically observed "
     "tendency, not a guarantee."
+)
+VOLUME_CAVEAT = (
+    "Volume-weighted GEX is a rough intraday proxy, not true positioning: volume counts both the "
+    "buyer and the seller of every trade and does not say whether positions were opened or closed. "
+    "Open interest is prior-night and static intraday; volume only shows where activity is today."
 )
 
 st.markdown(
@@ -84,6 +91,14 @@ with st.sidebar:
         index=list(config.SIGN_CONVENTIONS).index(config.DEFAULT_SIGN_CONVENTION),
         help=SIGN_HELP,
     )
+    mode = st.radio(
+        "GEX weighting",
+        options=list(config.WEIGHTING_MODES),
+        format_func=lambda k: config.WEIGHTING_MODES[k],
+        index=list(config.WEIGHTING_MODES).index(config.DEFAULT_WEIGHTING_MODE),
+        help="Contract count that multiplies each contract's dollar gamma. Open interest = standard GEX "
+             "(prior-night positions). Today's volume = where trading is happening now. " + VOLUME_CAVEAT,
+    )
     r = st.number_input("Risk-free rate (annual, decimal)", value=config.DEFAULT_RISK_FREE_RATE,
                         min_value=0.0, max_value=0.2, step=0.0025, format="%.4f")
     q = st.number_input("Dividend yield (annual, decimal)", value=config.DEFAULT_DIVIDEND_YIELD,
@@ -132,7 +147,8 @@ st.markdown(
 # ---------------------------------------------------------------------------
 # Calculations
 # ---------------------------------------------------------------------------
-prepared, iv_report = gc.prepare_chain(snap.chain, snap.spot, r=r, q=q)
+# Volume modes also keep zero-OI contracts that traded today (strikes opened today).
+prepared, iv_report = gc.prepare_chain(snap.chain, snap.spot, r=r, q=q, keep_traded=mode != "oi")
 if prepared.empty:
     st.error("No usable contracts (all expired, zero open interest, or missing IV).")
     st.stop()
@@ -148,27 +164,71 @@ view = st.selectbox(
 )
 selected = None if view == COMBINED else view
 
+# Weighting. With no volume in this selection (weekend, pre-market) the volume
+# views would be empty, so fall back to open interest and say so.
+sel_rows = prepared if selected is None else prepared[prepared["expiry"] == selected]
+has_volume = bool((sel_rows["volume"] > 0).any())
+if mode != "oi" and not has_volume:
+    st.info("No contracts in this selection have traded today (volume is zero everywhere, as on weekends "
+            "or before the open), so volume-weighted GEX can't be shown. Showing open-interest weighting.")
+weight = "volume" if (mode == "volume" and has_volume) else "open_interest"
+by_vol = weight == "volume"
+
 res = gc.run_analysis(prepared, snap.spot, convention=convention, r=r, q=q,
-                      expiry=selected, display_range_pct=range_pct)
+                      expiry=selected, display_range_pct=range_pct, weight=weight)
+res_vol = (gc.run_analysis(prepared, snap.spot, convention, r, q, selected, range_pct, weight="volume")
+           if mode == "compare" and has_volume else None)
+
+# Expected move: what options are pricing, from the ATM straddle / ATM IV.
+moves = vm.expected_moves(snap.chain, snap.spot, r=r, q=q)
+em = vm.pick(moves, selected)
+if em is None:
+    em_label = em_note = ""
+else:
+    when = f"{em.expiry:%a %d %b}" + (" - nearest expiry" if selected is None else "")
+    em_label = f"±1σ expected move ({when})"
+    em_note = viz.em_note(em, em_label, res)
 
 # ---------------------------------------------------------------------------
 # Summary panel
 # ---------------------------------------------------------------------------
 cols = st.columns(6)
 card(cols[0], "SPX Spot", f"{res.spot:,.2f}", C["spot"])
-card(cols[1], "Call Wall", f"{res.call_wall:,.0f}" if res.call_wall else "n/a", C["call"],
-     "Strike with the largest unsigned call dollar gamma")
-card(cols[2], "Put Wall", f"{res.put_wall:,.0f}" if res.put_wall else "n/a", C["put"],
-     "Strike with the largest unsigned put dollar gamma")
-card(cols[3], "Total Net GEX", viz.fmt_usd(res.total_net_gex),
+vol_tag = " (by volume)" if by_vol else ""
+vol_tip = (" Weighted by today's volume. " + VOLUME_CAVEAT) if by_vol else ""
+card(cols[1], "Call Wall" + vol_tag, f"{res.call_wall:,.0f}" if res.call_wall else "n/a", C["call"],
+     "Strike with the largest unsigned call dollar gamma." + vol_tip)
+card(cols[2], "Put Wall" + vol_tag, f"{res.put_wall:,.0f}" if res.put_wall else "n/a", C["put"],
+     "Strike with the largest unsigned put dollar gamma." + vol_tip)
+card(cols[3], "Total Net GEX" + vol_tag, viz.fmt_usd(res.total_net_gex),
      C["call"] if res.total_net_gex >= 0 else C["put"],
-     "$ of SPX dealers would trade per 1% move, under the assumed sign convention. " + SIGN_HELP)
-card(cols[4], "Gamma Flip", f"{res.gamma_flip:,.2f}" if res.gamma_flip else "none in ±20%", C["flip"],
-     "SPX level where total net GEX, recomputed at hypothetical spots, crosses zero (nearest to spot)")
+     "$ of SPX dealers would trade per 1% move, under the assumed sign convention. " + SIGN_HELP + vol_tip)
+card(cols[4], res.flip_label, f"{res.gamma_flip:,.2f}" if res.gamma_flip else "none in ±20%", C["flip"],
+     "SPX level where total net GEX, recomputed at hypothetical spots, crosses zero (nearest to spot)." + vol_tip)
 regime_color = C["call"] if res.regime.key == "positive" else C["put"]
 card(cols[5], "Gamma Regime", res.regime.key.capitalize(), regime_color)
 
-scope = "all expirations combined" if selected is None else f"the {selected:%d %b %Y} expiry only"
+EM_HELP = ("What the options market is pricing, not a forecast. 1σ = spot × ATM IV × √T: about 68% of "
+           "the implied distribution lies inside it. The ATM straddle is ≈0.8 × the 1σ move "
+           "(expected absolute move), so the two are different numbers.")
+em_cols = st.columns([2, 1], gap="small")
+if em is None:
+    card(em_cols[0], "Expected move (1σ)", "n/a", C["em_edge"],
+         "No expiry in this selection has an ATM call and put that both have bid > 0 and ask > 0.")
+else:
+    em_scope = f"{em.expiry:%d %b}" + (" · nearest expiry" if selected is None else "")
+    card(em_cols[0], f"Expected move (1σ) · {em_scope}",
+         f"±{em.move_pts:,.1f} pts (±{em.move_pct:.2%}) → [{em.low:,.0f} – {em.high:,.0f}]",
+         C["em_edge"], EM_HELP)
+    card(em_cols[1], f"ATM straddle · {em.atm_strike:,.0f} strike",
+         f"{em.straddle:,.2f} pts (±{em.straddle / res.spot:.2%})", C["em_edge"],
+         "Call mid + put mid at the ATM strike: the straddle-based move, ≈0.8 × the 1σ move. " + EM_HELP)
+
+base_scope = "all expirations combined" if selected is None else f"the {selected:%d %b %Y} expiry only"
+scope = base_scope
+scope +=", weighted by today's volume (rough intraday proxy, not positioning)" if by_vol else ""
+if mode == "compare" and res_vol is not None:
+    scope += " (open-interest weighting; the volume-weighted version is in the GEX by strike tab)"
 st.markdown(
     f'<div class="regime" style="border-color:{regime_color};background:{regime_color}14">'
     f'<b style="color:{regime_color}">{res.regime.title}</b> - {res.regime.sentence}'
@@ -180,18 +240,52 @@ st.caption(f"ⓘ Sign convention in use: **{config.SIGN_CONVENTIONS[convention][
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-t_strike, t_exp, t_prof, t_quality, t_method = st.tabs(
-    ["GEX by strike", "Per-expiry breakdown", "Gamma profile", "Data quality", "Methodology"]
+t_strike, t_exp, t_prof, t_cv, t_quality, t_method = st.tabs(
+    ["GEX by strike", "Per-expiry breakdown", "Gamma profile", "Charm & Vanna", "Data quality", "Methodology"]
 )
 
 with t_strike:
     title = "SPX Gamma Exposure by Strike - " + ("all expirations" if selected is None else f"{selected:%d %b %Y}")
-    st.plotly_chart(viz.gex_strike_chart(res, show_net, show_agg, range_pct, title, bucket), width="stretch")
+    if res_vol is None:
+        st.plotly_chart(viz.gex_strike_chart(res, show_net, show_agg, range_pct, title + (" - by volume" if by_vol else ""),
+                                             bucket, em=em, em_label=em_label, note=em_note), width="stretch")
+    else:
+        # Side by side on wide screens; Streamlit stacks columns on narrow ones.
+        c_oi, c_vol = st.columns(2)
+        for col_, r_, suffix in ((c_oi, res, "by open interest"), (c_vol, res_vol, "by volume")):
+            note_ = viz.em_note(em, em_label, r_)
+            col_.plotly_chart(viz.gex_strike_chart(r_, show_net, show_agg, range_pct, f"GEX {suffix}", bucket,
+                                                   em=em, em_label=em_label, note=note_), width="stretch")
+        st.markdown("**Open interest vs today's volume**")
+        st.dataframe(viz.comparison_table(res, res_vol), hide_index=True, width="stretch")
+    if mode != "oi" and has_volume:
+        st.caption("ⓘ " + VOLUME_CAVEAT)
+
+    with st.expander("Volume / OI: where today's activity is large relative to open interest",
+                     expanded=mode != "oi"):
+        vo = gc.volume_oi_ratios(sel_rows, config.VOLUME_OI_TOP_N)
+        if vo.empty:
+            st.info("No contracts with both open interest and volume today in this selection.")
+        else:
+            st.dataframe(pd.DataFrame({
+                "Expiry": pd.to_datetime(vo["expiry"]).dt.strftime("%Y-%m-%d"),
+                "Strike": vo["strike"].map("{:,.0f}".format),
+                "Type": vo["type"].str.capitalize(),
+                "Volume (contracts)": vo["volume"].map("{:,.0f}".format),
+                "OI (contracts)": vo["open_interest"].map("{:,.0f}".format),
+                "Volume / OI (×)": vo["ratio"].map("{:,.2f}".format),
+            }), hide_index=True, width="stretch")
+            st.caption(f"Top {config.VOLUME_OI_TOP_N} contracts by today's volume ÷ start-of-day open interest "
+                       "(OI > 0 only). High ratios suggest new positions may be opening today. Volume alone "
+                       "can't confirm it: it counts buyers and sellers and doesn't show opens vs closes.")
 
 with t_exp:
     # Always computed across ALL expiries so near vs far-dated GEX can be compared.
-    full = res if selected is None else gc.run_analysis(prepared, snap.spot, convention, r, q, None, range_pct)
+    full = res if selected is None else gc.run_analysis(prepared, snap.spot, convention, r, q, None, range_pct,
+                                                        weight=weight)
     st.plotly_chart(viz.expiry_breakdown_chart(full.by_expiry, max_exp), width="stretch")
+    if by_vol:
+        st.caption("Weighted by today's volume. " + VOLUME_CAVEAT)
     tbl = full.by_expiry.copy()
     tbl["expiry"] = pd.to_datetime(tbl["expiry"]).dt.strftime("%Y-%m-%d")
     for c_ in ("call_raw", "put_raw", "call_gex", "put_gex", "net_gex"):
@@ -208,6 +302,32 @@ with t_exp:
         hide_index=True, width="stretch",
     )
 
+    st.subheader("Expected move by expiry")
+    if moves:
+        emt = vm.to_frame(moves)
+        st.dataframe(
+            pd.DataFrame({
+                "Expiry": pd.to_datetime(emt["expiry"]).dt.strftime("%Y-%m-%d"),
+                "Root": emt["root"],
+                "Days": emt["dte"].map("{:.1f}".format),
+                "ATM strike": emt["atm_strike"].map("{:,.0f}".format),
+                "ATM IV (%)": (emt["atm_iv"] * 100).map("{:.2f}".format),
+                "Straddle (pts)": emt["straddle"].map("{:,.2f}".format),
+                "1σ move (pts)": emt["move_pts"].map("±{:,.2f}".format),
+                "1σ move (%)": (emt["move_pct"] * 100).map("±{:.2f}".format),
+                "1σ low": emt["low"].map("{:,.2f}".format),
+                "1σ high": emt["high"].map("{:,.2f}".format),
+            }),
+            hide_index=True, width="stretch",
+        )
+        st.caption("ATM strike = strike nearest spot with a call and a put that both have bid > 0 and ask > 0. "
+                   "ATM IV = average of that call's and put's IV (CBOE feed, else back-solved from the mid). "
+                   "1σ move = spot × ATM IV × √T (index points). Straddle = call mid + put mid, ≈0.8 × the 1σ "
+                   "move. On dates with both roots, the PM-settled SPXW pair is used. These describe what "
+                   "options are pricing now, not a forecast.")
+    else:
+        st.info("No expiry has an ATM call and put with two-sided quotes, so no expected move can be shown.")
+
 with t_prof:
     st.plotly_chart(viz.gamma_profile_chart(res), width="stretch")
     if len(res.all_flips) > 1:
@@ -216,6 +336,57 @@ with t_prof:
                    "nearest to spot: " + ", ".join(f"{f:,.0f}" for f in sorted(nearest))
                    + ". The headline flip is the one nearest spot. Many crossings usually mean "
                    "positioning is fragmented (often by short-dated expiries).")
+
+with t_cv:
+    # Same contracts as the GEX view: selected expiry, and the active weighting
+    # (open interest in "Compare both").
+    ex = exp_mod.compute_exposures(res.contracts, res.spot, convention, r, q, weight=res.weight)
+    w_txt = config.GEX_WEIGHTINGS[res.weight]
+    a_, b_ = st.columns(2)
+    card(a_, "Net charm (CEX)", f"{viz.fmt_usd(ex.net_charm)} per day",
+         C["call"] if ex.net_charm >= 0 else C["put"],
+         "$ change in the assumed dealer delta per calendar day that passes, price and IV unchanged. "
+         + SIGN_HELP)
+    card(b_, "Net vanna (VEX)", f"{viz.fmt_usd(ex.net_vanna)} per vol point",
+         C["call"] if ex.net_vanna >= 0 else C["put"],
+         "$ change in the assumed dealer delta per 1 vol-point rise in implied volatility, price unchanged. "
+         + SIGN_HELP)
+    st.caption(f"Computed from {base_scope}, weighted by {w_txt}, under the assumed sign convention "
+               f"({config.SIGN_CONVENTIONS[convention]['label']}). Units: $ of SPX delta.")
+
+    cv_scope = "all expirations" if selected is None else f"{selected:%d %b %Y}"
+    st.plotly_chart(viz.exposure_strike_chart(ex.by_strike, res, "charm", range_pct,
+                                              f"SPX Charm Exposure by Strike - {cv_scope}", bucket,
+                                              em=em, em_label=em_label, note=viz.em_note(em, em_label, res)),
+                    width="stretch")
+    sell_buy = "sell" if ex.net_charm >= 0 else "buy"
+    st.markdown(
+        f"**Charm** is how dealer hedges would shift as time passes with price (and IV) unchanged: option "
+        f"deltas drift toward 0 or 1 as expiry approaches. The drift speeds up near expiry, so it matters "
+        f"most into the close, on 0DTE and around monthly OPEX. Under the assumed convention, a **positive** "
+        f"total means the dealer delta rises as time passes, so staying hedged means *selling* about that "
+        f"much SPX exposure per day; a **negative** total means *buying*. Now: **{viz.fmt_usd(ex.net_charm)} "
+        f"per day** → hedging would mean {sell_buy}ing roughly {viz.fmt_usd(abs(ex.net_charm), signed=False)} "
+        f"of SPX per day if nothing else changed. This describes hedging needs under an assumption, not a "
+        f"price forecast. T is floored at 30 minutes, so 0DTE charm stays finite but large."
+    )
+
+    st.plotly_chart(viz.exposure_strike_chart(ex.by_strike, res, "vanna", range_pct,
+                                              f"SPX Vanna Exposure by Strike - {cv_scope}", bucket,
+                                              em=em, em_label=em_label, note=viz.em_note(em, em_label, res)),
+                    width="stretch")
+    st.markdown(
+        "**Vanna** is how dealer hedges would shift when implied volatility moves with price unchanged, for "
+        "example as IV falls after a scheduled event. Under the assumed convention, a **positive** total means "
+        "a 1-point IV *rise* raises the dealer delta (hedge: *sell*) and an IV *fall* lowers it (hedge: *buy*); "
+        "a **negative** total means the reverse. Now: **"
+        f"{viz.fmt_usd(ex.net_vanna)} per vol point**. This describes hedging sensitivity under an assumption, "
+        "not a price forecast; real IV moves are rarely uniform across strikes."
+    )
+    if mode == "compare" and res_vol is not None:
+        st.caption("'Compare both' is selected: charm and vanna here use open-interest weighting.")
+    elif by_vol:
+        st.caption(VOLUME_CAVEAT)
 
 with t_quality:
     rep = iv_report
@@ -264,6 +435,24 @@ each contract's current IV (sticky-strike simplification).
 **Gamma flip:** the level where that recomputed total crosses zero, searched on a
 {config.FLIP_GRID_POINTS}-point grid across ±{config.FLIP_SEARCH_RANGE_PCT:.0%} of spot with linear
 interpolation; the crossing nearest spot is shown.
+
+**GEX weighting:** open interest (default) is the standard GEX: prior-night positions, static
+intraday. "Today's volume" runs the identical pipeline (same dollar-gamma formula and sign
+assumption) with today's volume in place of open interest, so walls, profile, the zero-gamma level
+and regime show where today's activity is concentrated. {VOLUME_CAVEAT} Buyer/seller classification
+of individual trades is not attempted: the free feed only carries each contract's last trade.
+
+**Charm & vanna exposure:** Black-Scholes vanna (∂Δ/∂σ) and charm (−∂Δ/∂T, per year) with the same
+*r*, *q*, *T* and IV as gamma. VEX = sign × vanna × weight × 100 × S × 0.01 ($ of delta change per
+1 vol point); CEX = sign × charm/365 × weight × 100 × S ($ of delta change per calendar day). Sign is
+the same dealer assumption; weight follows the GEX weighting control.
+
+**Expected move (amber band):** for each expiry, the ATM strike is the strike nearest spot where
+both the call and the put have bid > 0 and ask > 0. ATM IV is the average of their IVs.
+1σ move = S × ATM IV × √T in index points (same *T* as above); the band is spot ± that. The
+straddle (call mid + put mid) is also shown: it is ≈0.8 × the 1σ move, not the same number. In the
+"all expirations" view the band uses the nearest non-expired expiry. This is market pricing of
+move size, not a forecast of direction or of the realised move.
 
 **Limits:** open interest is start-of-day; quotes are delayed ≥15 minutes; the dealer position
 is assumed, not observed. {NOT_A_FORECAST}

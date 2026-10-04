@@ -74,6 +74,21 @@ SIGN_CONVENTIONS = {
 DEFAULT_SIGN_CONVENTION = "standard"
 
 # ---------------------------------------------------------------------------
+# GEX weighting: which contract count multiplies dollar gamma
+# ---------------------------------------------------------------------------
+# Open interest is prior-night and static intraday. Today's volume shows where
+# activity is now, but counts buyers AND sellers and does not say whether a
+# trade opened or closed a position, so volume weighting is a rough proxy.
+GEX_WEIGHTINGS = {"open_interest": "open interest", "volume": "today's volume"}
+WEIGHTING_MODES = {                 # sidebar "GEX weighting" choices
+    "oi": "Open interest",          # default, the standard GEX
+    "volume": "Today's volume",
+    "compare": "Compare both",
+}
+DEFAULT_WEIGHTING_MODE = "oi"
+VOLUME_OI_TOP_N = 15                # rows in the Volume / OI table
+
+# ---------------------------------------------------------------------------
 # Gamma-flip search / display
 # ---------------------------------------------------------------------------
 FLIP_SEARCH_RANGE_PCT = 0.20       # search hypothetical spots within +/-20% of spot
@@ -100,4 +115,6 @@ COLORS = {
         "agg_line": "#b388ff",   # soft purple - Aggregate GEX
     "spot": "#4f9dff",       # blue
     "flip": "#d6a4ff",       # light purple, dashed
+    "em_edge": "#f5b84a",                   # amber - expected-move (1 sigma) band edges
+    "em_band": "rgba(245,184,74,0.07)",     # amber, faint - expected-move band fill
 }

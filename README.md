@@ -11,6 +11,8 @@ spx-gex-dashboard/
 ├── app.py               Streamlit UI (entry point)
 ├── data_fetcher.py      Downloads + parses the CBOE chain
 ├── gex_calculator.py    Black-Scholes gamma, GEX, walls, flip, regime
+├── vol_metrics.py       Expected move (ATM straddle / ATM IV) per expiry
+├── exposures.py         Charm & vanna exposure (CEX / VEX)
 ├── visualizer.py        Plotly dark-theme charts
 ├── config.py            All constants (URLs, sign convention, colours...)
 ├── requirements.txt     Exact package versions
@@ -130,6 +132,74 @@ cases and lists every affected contract, so nothing happens silently.
   moves (sticky-strike simplification).
 - Time to expiry uses calendar time to 09:30 ET (SPX) or 16:00 ET (SPXW), floored
   at 30 minutes so 0DTE gamma doesn't explode just before the close.
+
+## Expected move bands
+
+What the options market is **pricing** for the size of a move by each expiry,
+not a forecast of direction or of the realised move. All inputs come from the
+chain already downloaded.
+
+- **ATM strike:** the strike nearest spot where both the call and the put have
+  bid > 0 and ask > 0 (and a usable IV). On dates with both roots, the
+  PM-settled SPXW pair is used.
+- **ATM IV** = average of that call's and put's IV, using the same IV policy as
+  the GEX (CBOE's IV, else back-solved from the mid).
+- **1σ move (index points)** = S × ATM IV × √T, with T exactly as in the GEX
+  calculation. The amber band on the strike chart is spot ± this. About 68% of
+  the implied distribution lies inside it (normal approximation).
+- **Straddle (index points)** = call mid + put mid. It is ≈0.8 × the 1σ move
+  (the expected *absolute* move, √(2/π)·σ), so the two are shown separately.
+- In the "All expirations" view the band uses the **nearest non-expired
+  expiry**, and the label says so. The chart note says whether the Call and Put
+  Walls sit inside or outside the 1σ range. The **Per-expiry breakdown** tab
+  has the full table.
+
+## GEX weighting: open interest vs today's volume
+
+Sidebar → **GEX weighting**: *Open interest* (default, unchanged), *Today's
+volume*, or *Compare both*.
+
+- Volume GEX uses the identical formula, gamma × S² × 0.01 × 100 × **volume**,
+  and the same dealer-sign assumption. Walls, gamma profile, the zero-gamma
+  level (labelled "Zero gamma (by volume)"), the aggregate line and the regime
+  are all recomputed from volume. Units are still $ per 1% SPX move.
+- Volume modes also keep contracts with zero OI that traded today (strikes
+  opened today). Open-interest results are identical either way.
+- **Volume / OI table:** top 15 contracts by today's volume ÷ start-of-day OI
+  (OI > 0). High ratios suggest new positions *may* be opening today.
+- **Caveat:** volume counts both the buyer and the seller of every trade and
+  does not say whether positions were opened or closed. Volume-weighted GEX is
+  a rough intraday proxy, **not** true positioning. Per-trade buyer/seller
+  classification is not attempted: the free feed only carries each contract's
+  last trade.
+- With zero volume everywhere (weekends, pre-market), the app says so and
+  shows open-interest weighting instead of empty charts.
+
+## Charm & vanna exposure
+
+The **Charm & Vanna** tab shows how the *assumed* dealer delta (and so the
+hedge) would drift when something other than price changes. It uses Black-Scholes
+with the same r, q, T and IV as gamma:
+
+```
+d1 = (ln(S/K) + (r − q + σ²/2)T) / (σ√T),   d2 = d1 − σ√T
+vanna      = ∂Δ/∂σ  = −e^(−qT) φ(d1) d2 / σ                     (calls = puts)
+charm_call = −∂Δ/∂T =  q e^(−qT) N(d1)  − e^(−qT) φ(d1) [2(r−q)T − d2 σ√T] / (2T σ√T)
+charm_put  = −∂Δ/∂T = −q e^(−qT) N(−d1) − e^(−qT) φ(d1) [2(r−q)T − d2 σ√T] / (2T σ√T)
+
+VEX = sign × vanna × weight × 100 × S × 0.01    → $ of delta change per 1 vol point
+CEX = sign × (charm/365) × weight × 100 × S     → $ of delta change per calendar day
+```
+
+- `sign` is the same dealer convention **assumption** as GEX. `weight` is OI or
+  volume and follows the GEX weighting control (OI in *Compare both*).
+- A **positive** total means the assumed dealer delta rises, so staying hedged
+  would mean *selling* that much SPX exposure. **Negative** means *buying*. For
+  vanna that is per 1-point IV *rise*; an IV fall reverses it.
+- Charm matters most into the close, on 0DTE and around OPEX. T is floored at
+  30 minutes, so 0DTE charm is large but finite.
+- Like GEX, these describe hedging needs under an assumption. They are not price
+  forecasts, and they assume IV moves uniformly across strikes, which it rarely does.
 
 ## Troubleshooting
 

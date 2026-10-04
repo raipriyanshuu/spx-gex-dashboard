@@ -119,6 +119,7 @@ def parse_payload(payload: dict[str, Any]) -> tuple[float, pd.DataFrame, str | N
             "open_interest": _num(raw, "open_interest").fillna(0.0),
             "volume": _num(raw, "volume").fillna(0.0),
             "gamma_cboe": _num(raw, "gamma"),           # CBOE's own gamma, kept for cross-checking only
+            "delta_cboe": _num(raw, "delta"),           # CBOE's own delta, kept for cross-checking only
         }
     )
 

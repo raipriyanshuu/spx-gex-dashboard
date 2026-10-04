@@ -14,7 +14,16 @@ a historical tendency, not a guarantee about what price will do next.
 
 Units: every GEX figure is dollars of underlying that dealers would buy/sell
 per 1% move in SPX:
-    dollar_gamma = gamma * S^2 * 0.01 * contract_multiplier * open_interest
+    dollar_gamma = gamma * S^2 * 0.01 * contract_multiplier * weight
+where weight is open interest (default) or, optionally, today's volume.
+
+VOLUME WEIGHTING IS A ROUGH PROXY
+---------------------------------
+Open interest is published once a day (prior night) and is static intraday.
+Today's volume shows where activity is happening now, but it counts BOTH the
+buyer and the seller of every trade and does not say whether positions were
+opened or closed. Volume-weighted GEX is therefore a rough intraday proxy for
+where new positioning MAY be building, not a measure of actual positioning.
 """
 
 from __future__ import annotations
@@ -49,6 +58,14 @@ def bs_gamma(S, K, T, sigma, r=0.0, q=0.0):
     return np.exp(-q * T) * pdf / (S * sigma * np.sqrt(T))
 
 
+def bs_delta(S, K, T, sigma, r=0.0, q=0.0, is_call=True):
+    """Black-Scholes delta: e^(-qT) N(d1) for calls, -e^(-qT) N(-d1) for puts. `is_call` may be an array."""
+    S, K, T, sigma = (np.asarray(x, dtype=float) for x in (S, K, T, sigma))
+    d1 = bs_d1(S, K, T, sigma, r, q)
+    disc = np.exp(-q * T)
+    return np.where(is_call, disc * norm.cdf(d1), -disc * norm.cdf(-d1))
+
+
 def bs_price(S, K, T, sigma, r=0.0, q=0.0, is_call=True):
     d1 = bs_d1(S, K, T, sigma, r, q)
     d2 = d1 - sigma * np.sqrt(T)
@@ -73,7 +90,10 @@ def implied_vol(price, S, K, T, r=0.0, q=0.0, is_call=True) -> float:
 
 
 def dollar_gamma(gamma, S, open_interest):
-    """$ of underlying traded per 1% move: gamma * S^2 * 0.01 * multiplier * OI."""
+    """
+    $ of underlying traded per 1% move: gamma * S^2 * 0.01 * multiplier * OI.
+    The last argument is any contract count: open interest, or today's volume.
+    """
     return gamma * np.asarray(S, dtype=float) ** 2 * 0.01 * config.CONTRACT_MULTIPLIER * open_interest
 
 
@@ -84,6 +104,40 @@ def expiry_datetime_et(root: str, expiry: date) -> datetime:
     """SPX (AM-settled monthlies) settle at the open; SPXW settle at the 4pm close."""
     t = time(9, 30) if root == "SPX" else time(16, 0)
     return datetime.combine(expiry, t, tzinfo=ET)
+
+
+def seconds_to_expiry(roots, expiries, now: datetime) -> np.ndarray:
+    """
+    Elapsed seconds from `now` to each contract's settlement (<= 0 means expired).
+    Subtraction goes through pandas Timestamps, which measure absolute time and
+    so stay correct across a DST change. (Two plain datetimes sharing a tzinfo
+    subtract as wall-clock time and would be an hour off after a DST switch.)
+    """
+    settle = pd.Series([expiry_datetime_et(r_, e) for r_, e in zip(roots, expiries)])
+    return np.array([(e - now).total_seconds() for e in settle], dtype=float)
+
+
+def years_to_expiry(secs) -> np.ndarray:
+    """T in years as used everywhere in the model, floored at config.MIN_T_YEARS."""
+    return np.maximum(np.asarray(secs, dtype=float) / config.SECONDS_PER_YEAR, config.MIN_T_YEARS)
+
+
+def mid_price(bid: float, ask: float) -> float:
+    """(bid + ask) / 2 for a two-sided quote; NaN if either side is missing or zero."""
+    return (bid + ask) / 2 if (bid > 0 and ask > 0) else np.nan
+
+
+def contract_iv(iv_feed: float, bid: float, ask: float, spot: float, strike: float, T: float,
+                r: float, q: float, is_call: bool) -> tuple[float, str]:
+    """
+    The IV policy of prepare_chain() for a single contract: CBOE's IV when it is
+    positive, otherwise back-solved from the mid. Returns (iv, source); iv is
+    NaN when neither works.
+    """
+    if np.isfinite(iv_feed) and iv_feed > 0:
+        return float(iv_feed), "CBOE feed"
+    solved = implied_vol(mid_price(bid, ask), spot, strike, T, r, q, is_call)
+    return solved, ("Back-solved from mid" if np.isfinite(solved) else "")
 
 
 @dataclass
@@ -106,9 +160,16 @@ def prepare_chain(
     now: datetime | None = None,
     r: float = config.DEFAULT_RISK_FREE_RATE,
     q: float = config.DEFAULT_DIVIDEND_YIELD,
+    keep_traded: bool = False,
 ) -> tuple[pd.DataFrame, IVReport]:
     """
     Add T (years) and a usable IV to each contract; drop what can't be used.
+
+    Zero-open-interest contracts are dropped (they carry no OI-weighted GEX).
+    keep_traded=True keeps those that traded today (volume > 0), which the
+    volume weighting needs: a strike opened today has volume but no OI yet.
+    OI-weighted results are identical either way, because run_analysis()
+    drops rows whose weight is zero.
 
     IV policy:
       1. Use CBOE's own IV when it is a positive finite number.
@@ -123,14 +184,16 @@ def prepare_chain(
     df = chain.copy()
 
     df["expiry_dt"] = [expiry_datetime_et(r_, e) for r_, e in zip(df["root"], df["expiry"])]
-    secs = np.array([(e - now).total_seconds() for e in df["expiry_dt"]], dtype=float)
+    secs = seconds_to_expiry(df["root"], df["expiry"], now)
     expired = secs <= 0
     rep.expired = int(expired.sum())
     df = df[~expired].copy()
-    df["T"] = np.maximum(secs[~expired] / config.SECONDS_PER_YEAR, config.MIN_T_YEARS)
+    df["T"] = years_to_expiry(secs[~expired])
     df["dte"] = secs[~expired] / 86400.0
 
     no_oi = df["open_interest"] <= 0
+    if keep_traded:
+        no_oi &= ~(df["volume"] > 0)
     rep.zero_open_interest = int(no_oi.sum())
     df = df[~no_oi].copy()
 
@@ -144,8 +207,7 @@ def prepare_chain(
     for idx in df.index[~feed_ok]:
         row = df.loc[idx]
         bid, ask = row["bid"], row["ask"]
-        mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else np.nan
-        solved = implied_vol(mid, spot, row["strike"], row["T"], r, q, row["type"] == "call")
+        solved = implied_vol(mid_price(bid, ask), spot, row["strike"], row["T"], r, q, row["type"] == "call")
         if np.isfinite(solved):
             df.at[idx, "iv"] = solved
             df.at[idx, "iv_source"] = "Back-solved from mid"
@@ -184,10 +246,12 @@ def dealer_signs(types: pd.Series, convention: str) -> np.ndarray:
     return np.where(types.to_numpy() == "call", conv["call"], conv["put"])
 
 
-def add_gex_columns(df: pd.DataFrame, spot: float, convention: str, r: float, q: float) -> pd.DataFrame:
+def add_gex_columns(df: pd.DataFrame, spot: float, convention: str, r: float, q: float,
+                    weight: str = "open_interest") -> pd.DataFrame:
+    """`weight`: contract-count column, "open_interest" (default) or "volume"."""
     out = df.copy()
     out["gamma"] = bs_gamma(spot, out["strike"], out["T"], out["iv"], r, q)
-    out["dollar_gamma"] = dollar_gamma(out["gamma"], spot, out["open_interest"])  # unsigned
+    out["dollar_gamma"] = dollar_gamma(out["gamma"], spot, out[weight])  # unsigned
     # Sign applied here is an ASSUMED dealer position - see dealer_signs().
     out["sign"] = dealer_signs(out["type"], convention)
     out["gex"] = out["sign"] * out["dollar_gamma"]
@@ -205,6 +269,8 @@ def aggregate_by_strike(df: pd.DataFrame) -> pd.DataFrame:
             "put_gex": np.where(~is_call, df["gex"], 0.0),
             "call_oi": np.where(is_call, df["open_interest"], 0.0),
             "put_oi": np.where(~is_call, df["open_interest"], 0.0),
+            "call_vol": np.where(is_call, df["volume"], 0.0),
+            "put_vol": np.where(~is_call, df["volume"], 0.0),
         }
     )
     by = g.groupby("strike", sort=True).sum()
@@ -228,6 +294,8 @@ def aggregate_by_expiry(df: pd.DataFrame) -> pd.DataFrame:
             "put_gex": np.where(~is_call, df["gex"], 0.0),
             "call_oi": np.where(is_call, df["open_interest"], 0.0),
             "put_oi": np.where(~is_call, df["open_interest"], 0.0),
+            "call_vol": np.where(is_call, df["volume"], 0.0),
+            "put_vol": np.where(~is_call, df["volume"], 0.0),
         }
     )
     by = g.groupby("expiry", sort=True).agg(
@@ -236,6 +304,8 @@ def aggregate_by_expiry(df: pd.DataFrame) -> pd.DataFrame:
         contracts=("root", "size"),
         call_oi=("call_oi", "sum"),
         put_oi=("put_oi", "sum"),
+        call_vol=("call_vol", "sum"),
+        put_vol=("put_vol", "sum"),
         call_raw=("call_raw", "sum"),
         put_raw=("put_raw", "sum"),
         call_gex=("call_gex", "sum"),
@@ -250,17 +320,18 @@ def aggregate_by_expiry(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Gamma profile (hypothetical spots), flip, walls, regime
 # ---------------------------------------------------------------------------
-def gamma_profile(df: pd.DataFrame, spot_levels, convention: str, r: float, q: float, chunk: int = 64) -> np.ndarray:
+def gamma_profile(df: pd.DataFrame, spot_levels, convention: str, r: float, q: float, chunk: int = 64,
+                  weight: str = "open_interest") -> np.ndarray:
     """
     Total net GEX recomputed as if SPX were at each hypothetical spot level.
     Each contract keeps its current IV (a "sticky-strike" simplification) and
-    the dealer sign ASSUMPTION from dealer_signs().
+    the dealer sign ASSUMPTION from dealer_signs(). `weight` as in add_gex_columns().
     """
     levels = np.asarray(spot_levels, dtype=float)
     K = df["strike"].to_numpy(float)[None, :]
     T = df["T"].to_numpy(float)[None, :]
     iv = df["iv"].to_numpy(float)[None, :]
-    w = (dealer_signs(df["type"], convention) * df["open_interest"].to_numpy(float)
+    w = (dealer_signs(df["type"], convention) * df[weight].to_numpy(float)
          * 0.01 * config.CONTRACT_MULTIPLIER)[None, :]
     out = np.empty(len(levels))
     for i in range(0, len(levels), chunk):
@@ -289,7 +360,7 @@ class Regime:
 
 
 def classify_regime(total_net_gex: float, spot: float, flip: float | None,
-                    near_pct: float = 0.005) -> Regime:
+                    near_pct: float = 0.005, flip_name: str = "gamma flip") -> Regime:
     """
     Regime = sign of total net GEX at the actual spot (which is exactly where the
     gamma profile is evaluated at spot). The flip adds context: how far spot is
@@ -297,11 +368,11 @@ def classify_regime(total_net_gex: float, spot: float, flip: float | None,
     """
     positive = total_net_gex > 0
     if flip is None:
-        where = "No gamma flip was found within ±20% of spot, so the sign is unlikely to change on a normal move."
+        where = f"No {flip_name} was found within ±20% of spot, so the sign is unlikely to change on a normal move."
     else:
         dist = spot - flip
         where = (f"Spot is {abs(dist):,.0f} points ({abs(dist) / spot:.2%}) "
-                 f"{'above' if dist > 0 else 'below'} the gamma flip at {flip:,.2f}.")
+                 f"{'above' if dist > 0 else 'below'} the {flip_name} at {flip:,.2f}.")
     near = flip is not None and abs(spot - flip) / spot < near_pct
     if positive:
         return Regime(
@@ -335,6 +406,8 @@ class GexResult:
     profile_values: np.ndarray
     aggregate_at_strikes: pd.Series     # profile evaluated at each strike (for the chart line)
     regime: Regime
+    flip_label: str = "Gamma Flip"      # chart / card label for gamma_flip
+    weight: str = "open_interest"       # contract-count column the GEX was weighted by
 
 
 def run_analysis(
@@ -345,13 +418,22 @@ def run_analysis(
     q: float = config.DEFAULT_DIVIDEND_YIELD,
     expiry: date | None = None,
     display_range_pct: float = config.DEFAULT_STRIKE_RANGE_PCT,
+    weight: str = "open_interest",
 ) -> GexResult:
-    """Full pipeline for either all expiries combined (expiry=None) or one expiry."""
-    df = prepared if expiry is None else prepared[prepared["expiry"] == expiry]
-    if df.empty:
-        raise ValueError("No contracts with open interest and IV for this selection.")
+    """
+    Full pipeline for either all expiries combined (expiry=None) or one expiry.
 
-    df = add_gex_columns(df, spot, convention, r, q)
+    weight="open_interest" (default) is the standard GEX. weight="volume" runs
+    the SAME pipeline with today's volume as the contract count: walls, profile,
+    flip ("zero gamma by volume"), aggregate line and regime all follow from it.
+    That is a rough intraday proxy, not positioning (see module docstring).
+    """
+    df = prepared if expiry is None else prepared[prepared["expiry"] == expiry]
+    df = df[df[weight] > 0]          # zero-weight contracts carry no exposure
+    if df.empty:
+        raise ValueError(f"No contracts with {config.GEX_WEIGHTINGS[weight]} and IV for this selection.")
+
+    df = add_gex_columns(df, spot, convention, r, q, weight)
     by_strike = aggregate_by_strike(df)
     by_expiry = aggregate_by_expiry(df)
     total = float(df["gex"].sum())
@@ -363,18 +445,36 @@ def run_analysis(
     # Gamma flip: fine grid of hypothetical spots, then the zero crossing nearest spot.
     levels = np.linspace(spot * (1 - config.FLIP_SEARCH_RANGE_PCT),
                          spot * (1 + config.FLIP_SEARCH_RANGE_PCT), config.FLIP_GRID_POINTS)
-    profile = gamma_profile(df, levels, convention, r, q)
+    profile = gamma_profile(df, levels, convention, r, q, weight=weight)
     flips = find_zero_crossings(levels, profile)
     flip = min(flips, key=lambda x: abs(x - spot)) if flips else None
 
     # "Aggregate GEX" line: total GEX recomputed as if each displayed strike were spot.
     lo, hi = spot * (1 - display_range_pct), spot * (1 + display_range_pct)
     shown = by_strike.loc[(by_strike["strike"] >= lo) & (by_strike["strike"] <= hi), "strike"].to_numpy()
-    agg = pd.Series(gamma_profile(df, shown, convention, r, q) if len(shown) else [], index=shown, dtype=float)
+    agg = pd.Series(gamma_profile(df, shown, convention, r, q, weight=weight) if len(shown) else [],
+                    index=shown, dtype=float)
 
+    by_volume = weight == "volume"
     return GexResult(
         spot=spot, contracts=df, by_strike=by_strike, by_expiry=by_expiry,
         total_net_gex=total, call_wall=call_wall, put_wall=put_wall,
         gamma_flip=flip, all_flips=flips, profile_levels=levels, profile_values=profile,
-        aggregate_at_strikes=agg, regime=classify_regime(total, spot, flip),
+        aggregate_at_strikes=agg,
+        regime=classify_regime(total, spot, flip,
+                               flip_name="zero-gamma level (by volume)" if by_volume else "gamma flip"),
+        flip_label="Zero gamma (by volume)" if by_volume else "Gamma Flip",
+        weight=weight,
     )
+
+
+def volume_oi_ratios(df: pd.DataFrame, n: int = 15) -> pd.DataFrame:
+    """
+    Top-n contracts by today's volume / open interest (OI > 0 only). A high
+    ratio suggests new positions MAY be opening today; volume alone cannot say
+    whether trades opened or closed positions, or who was buyer or seller.
+    """
+    d = df[(df["open_interest"] > 0) & (df["volume"] > 0)]
+    out = d[["expiry", "strike", "type", "volume", "open_interest"]].copy()
+    out["ratio"] = d["volume"] / d["open_interest"]
+    return out.sort_values(["ratio", "volume"], ascending=False).head(n).reset_index(drop=True)

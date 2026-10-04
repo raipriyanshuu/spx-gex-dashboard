@@ -3,8 +3,10 @@
 A local Streamlit app that downloads the full SPX option chain from CBOE's free
 delayed feed and shows call/put GEX by strike, the Net GEX (cumulative) and
 Aggregate GEX lines, the Call Wall, Put Wall, Gamma Flip and the current gamma
-regime. It runs on `http://localhost:8501`, and the only request it sends out is
-the CBOE download, made only when you click **Refresh Data**.
+regime, with SPX's intraday price drawn beside the bars on the same axis. It runs
+on `http://localhost:8501`, and the only requests it sends out are two CBOE
+downloads (the option chain and SPX 1-minute price bars), made only when you
+click **Refresh Data**.
 
 ```
 spx-gex-dashboard/
@@ -103,6 +105,32 @@ GET https://cdn.cboe.com/api/global/delayed_quotes/options/_SPX.json
   ≥15 minutes. Open interest is updated once a day. Use falls under CBOE's
   website terms: this app makes one request per click for personal use. Don't
   redistribute the data or poll it in a loop.
+
+**SPX price bars** come from the file behind cboe.com's intraday SPX chart:
+
+```
+GET https://cdn.cboe.com/api/global/delayed_quotes/charts/intraday/_SPX.json
+```
+
+It holds 1-minute OHLC bars (US Eastern times) for the latest session, with the
+same delay and caveats as above. It is fetched once per **Refresh Data** click,
+right after the chain. If it fails, the GEX still updates and only the price
+panel is hidden, with a warning.
+
+## SPX price panel
+
+The GEX-by-strike chart has a candlestick panel on its left (sidebar toggle
+**Show SPX price panel**, on by default). Both panels share one y-axis, so the
+Spot, Call Wall, Put Wall, gamma flip and ±1σ lines, and the regime shading,
+run straight through the session's price action. You can see at a glance where
+SPX is trading, and has traded today, relative to those levels.
+
+- The levels are the **current** snapshot drawn across the whole session.
+  Walls and flip were not necessarily at these levels earlier in the day.
+- The strike-range slider zooms both panels together. Narrow it (e.g. ±1%) to
+  see intraday detail.
+- Showing price beside the levels is for reference; it does not imply the
+  levels predict where price goes.
 
 ## Implied volatility
 

@@ -17,6 +17,13 @@ CBOE_CHAIN_URLS = [
     "https://cdn.cboe.com/api/global/delayed_quotes/options/_SPX.json",
     "https://cdn-api.cboe.com/api/global/delayed_quotes/options/_SPX.json",
 ]
+# SPX 1-minute bars for the latest session (the file behind cboe.com's intraday
+# SPX chart). Same CDN, same delay and caveats; fetched once per Refresh click
+# for the price panel beside the GEX chart.
+CBOE_INTRADAY_URLS = [
+    "https://cdn.cboe.com/api/global/delayed_quotes/charts/intraday/_SPX.json",
+    "https://cdn-api.cboe.com/api/global/delayed_quotes/charts/intraday/_SPX.json",
+]
 HTTP_TIMEOUT_SECONDS = 30
 
 # Option roots we keep. SPX = AM-settled monthlies, SPXW = PM-settled weeklies/dailies.

@@ -18,6 +18,7 @@ import config  # noqa: E402
 import data_fetcher as dfh  # noqa: E402
 import exposures as ex  # noqa: E402
 import gex_calculator as gc  # noqa: E402
+import visualizer as viz  # noqa: E402
 import vol_metrics as vm  # noqa: E402
 
 
@@ -73,6 +74,45 @@ class TestParsing(unittest.TestCase):
         spot, chain, ts, notes = dfh.parse_payload(payload)
         self.assertEqual(spot, 6600.0)
         self.assertEqual(len(chain), len(payload["data"]["options"]))
+
+
+def intraday_payload():
+    """CBOE intraday chart JSON shape (charts/intraday/_SPX.json): 1-minute bars, ET times."""
+    bars = []
+    for i, minute in enumerate(range(9 * 60 + 31, 9 * 60 + 36)):
+        px = 6600.0 + i
+        bars.append({"datetime": f"2026-10-02T{minute // 60:02d}:{minute % 60:02d}:00", "sequence_number": i,
+                     "price": {"open": px, "high": px + 2, "low": px - 1, "close": px + 1},
+                     "volume": {"stock_volume": 0, "calls_volume": 10, "puts_volume": 12,
+                                "total_options_volume": 22}})
+    return {"timestamp": "2026-10-02 16:15:00", "symbol": "_SPX", "data": bars}
+
+
+class TestIntraday(unittest.TestCase):
+    def test_parse(self):
+        b = dfh.parse_intraday(intraday_payload())
+        self.assertEqual(list(b.columns), ["time", "open", "high", "low", "close"])
+        self.assertEqual(len(b), 5)
+        self.assertEqual(str(b["time"].dt.tz), "America/New_York")
+        self.assertEqual(b["time"].iloc[0].hour, 9)
+        self.assertEqual(b["close"].iloc[-1], 6605.0)
+
+    def test_parse_rejects_empty(self):
+        with self.assertRaises(dfh.DataFetchError):
+            dfh.parse_intraday({"data": []})
+
+    def test_chart_with_and_without_price_panel(self):
+        payload, now = synthetic_payload()
+        spot, chain, _, _ = dfh.parse_payload(payload)
+        prepared, _ = gc.prepare_chain(chain, spot, now=now)
+        res = gc.run_analysis(prepared, spot)
+        plain = viz.gex_strike_chart(res)
+        self.assertFalse(any(t.type == "candlestick" for t in plain.data))
+        fig = viz.gex_strike_chart(res, price=dfh.parse_intraday(intraday_payload()))
+        candles = [t for t in fig.data if t.type == "candlestick"]
+        self.assertEqual(len(candles), 1)
+        self.assertEqual((candles[0].xaxis, candles[0].yaxis), ("x3", "y"))   # shares the strike axis
+        self.assertLess(fig.layout.xaxis3.domain[1], fig.layout.xaxis.domain[0])
 
 
 class TestMath(unittest.TestCase):

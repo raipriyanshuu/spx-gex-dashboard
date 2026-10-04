@@ -18,10 +18,19 @@ Caveats you should know:
   * Open interest is published once per day (start of day), so intraday OI
     changes are not visible anywhere in this feed.
   * CBOE's website terms of use govern this data. Personal, on-demand,
-    low-frequency use (what this app does: one request per click) is the
-    lowest-impact pattern; do not redistribute the data or poll it in a loop.
+    low-frequency use (what this app does: one chain request plus one price
+    request per click) is the lowest-impact pattern; do not redistribute the
+    data or poll it in a loop.
 
-Nothing is cached: every call to fetch_spx_chain() makes a fresh HTTP request.
+SPX PRICE BARS (for the price panel beside the GEX chart)
+---------------------------------------------------------
+    GET https://cdn.cboe.com/api/global/delayed_quotes/charts/intraday/_SPX.json
+
+The file behind cboe.com's own SPX intraday chart: 1-minute OHLC bars for the
+latest session (times in US Eastern), same delay and same caveats as above.
+
+Nothing is cached: every call to fetch_spx_chain() / fetch_spx_intraday()
+makes a fresh HTTP request.
 """
 
 from __future__ import annotations
@@ -139,40 +148,79 @@ def parse_payload(payload: dict[str, Any]) -> tuple[float, pd.DataFrame, str | N
     return spot, chain, payload.get("timestamp"), notes
 
 
-def fetch_spx_chain() -> ChainSnapshot:
-    """Download a fresh SPX chain from CBOE. Always hits the network."""
-    headers = {
-        # A normal browser-style request; the CDN rejects some library defaults.
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/128.0 Safari/537.36"
-        ),
-        "Accept": "application/json",
-        # Ask any intermediate cache for a fresh copy.
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
+HEADERS = {
+    # A normal browser-style request; the CDN rejects some library defaults.
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/128.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+    # Ask any intermediate cache for a fresh copy.
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
+
+
+def _get_json(urls: list[str], what: str) -> tuple[dict[str, Any], str]:
+    """GET the first URL that returns JSON. Returns (payload, url). Always hits the network."""
     errors: list[str] = []
-    for url in config.CBOE_CHAIN_URLS:
+    for url in urls:
         try:
-            resp = requests.get(url, headers=headers, timeout=config.HTTP_TIMEOUT_SECONDS)
+            resp = requests.get(url, headers=HEADERS, timeout=config.HTTP_TIMEOUT_SECONDS)
             resp.raise_for_status()
-            payload = resp.json()
+            return resp.json(), url
         except (requests.RequestException, ValueError) as exc:
             errors.append(f"{url}: {exc}")
-            continue
+    raise DataFetchError(f"Could not download the {what} from CBOE.\n" + "\n".join(errors))
 
-        spot, chain, cboe_ts, notes = parse_payload(payload)
-        return ChainSnapshot(
-            spot=spot,
-            chain=chain,
-            cboe_timestamp=cboe_ts,
-            fetched_at_utc=datetime.now(timezone.utc),
-            source_url=url,
-            notes=notes,
-        )
 
-    raise DataFetchError("Could not download the SPX chain from CBOE.\n" + "\n".join(errors))
+def fetch_spx_chain() -> ChainSnapshot:
+    """Download a fresh SPX chain from CBOE. Always hits the network."""
+    payload, url = _get_json(config.CBOE_CHAIN_URLS, "SPX chain")
+    spot, chain, cboe_ts, notes = parse_payload(payload)
+    return ChainSnapshot(
+        spot=spot,
+        chain=chain,
+        cboe_timestamp=cboe_ts,
+        fetched_at_utc=datetime.now(timezone.utc),
+        source_url=url,
+        notes=notes,
+    )
+
+
+@dataclass
+class IntradayBars:
+    """One fresh download of SPX 1-minute bars for the latest session."""
+
+    bars: pd.DataFrame                # time (tz-aware ET), open, high, low, close
+    cboe_timestamp: str | None
+    source_url: str
+
+
+def parse_intraday(payload: dict[str, Any]) -> pd.DataFrame:
+    """CBOE intraday chart JSON -> one row per 1-minute bar, sorted by time."""
+    if not isinstance(payload, dict) or not payload.get("data"):
+        raise DataFetchError("CBOE intraday JSON has no bars.")
+    rows = pd.DataFrame(payload["data"])
+    if "datetime" not in rows.columns or "price" not in rows.columns:
+        raise DataFetchError("CBOE intraday JSON bars are missing 'datetime' or 'price'.")
+    px = pd.DataFrame(list(rows["price"]))
+    bars = pd.DataFrame({
+        # CBOE stamps bars in US Eastern time without an offset.
+        "time": pd.to_datetime(rows["datetime"], errors="coerce").dt.tz_localize(
+            "America/New_York", ambiguous="NaT", nonexistent="NaT"),
+        **{c: _num(px, c) for c in ("open", "high", "low", "close")},
+    })
+    bars = bars.dropna().sort_values("time").reset_index(drop=True)
+    if bars.empty:
+        raise DataFetchError("CBOE intraday JSON contained no usable bars.")
+    return bars
+
+
+def fetch_spx_intraday() -> IntradayBars:
+    """Download SPX 1-minute bars for the latest session from CBOE. Always hits the network."""
+    payload, url = _get_json(config.CBOE_INTRADAY_URLS, "SPX intraday price bars")
+    return IntradayBars(bars=parse_intraday(payload), cboe_timestamp=payload.get("timestamp"), source_url=url)
 
 
 if __name__ == "__main__":

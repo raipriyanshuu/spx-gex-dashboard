@@ -13,6 +13,9 @@ Main chart layout:
     Gamma Flip (dashed purple), each labelled with its exact level.
   * Optional +/-1 sigma expected-move band (faint amber, dotted edges labelled
     with their levels). It shows what options are pricing, not a forecast.
+  * Optional SPX price panel on the left: 1-minute candles on their own time
+    axis (x3) sharing the strike y-axis, so the reference lines and bands run
+    straight through the price action.
 Both x-axes are symmetric around zero so their zero points line up.
 """
 
@@ -125,6 +128,40 @@ def _place_labels(levels: list[float], lo: float, hi: float, min_gap: float) -> 
     return placed
 
 
+def _hband(fig: go.Figure, y0: float, y1: float, color: str) -> None:
+    """Shaded horizontal band across the whole plot width (both panels when a price panel is shown)."""
+    fig.add_shape(type="rect", xref="paper", x0=0, x1=1, yref="y", y0=y0, y1=y1,
+                  fillcolor=color, line_width=0, layer="below")
+
+
+PRICE_PANEL_WIDTH = 0.26          # share of the plot width given to the SPX price panel
+PRICE_PANEL_GAP = 0.015
+
+
+def _add_price_panel(fig: go.Figure, bars: pd.DataFrame) -> dict:
+    """
+    SPX 1-minute candles on their own x-axis (x3, left part of the figure) that
+    share the strike/price y-axis with the GEX bars, so price can be read
+    directly against the walls, flip and expected-move lines. Returns the layout
+    updates that split the width between the two panels.
+    """
+    last = bars["time"].iloc[-1]
+    fig.add_trace(go.Candlestick(
+        x=bars["time"], open=bars["open"], high=bars["high"], low=bars["low"], close=bars["close"],
+        xaxis="x3", yaxis="y", name="SPX (1-min)", whiskerwidth=0, line=dict(width=1),
+        increasing=dict(line=dict(color=C["call"]), fillcolor=C["call"]),
+        decreasing=dict(line=dict(color=C["put"]), fillcolor=C["put"]),
+    ))
+    return dict(
+        xaxis=dict(domain=[PRICE_PANEL_WIDTH + PRICE_PANEL_GAP, 1.0]),
+        xaxis3=dict(domain=[0.0, PRICE_PANEL_WIDTH], anchor="y", rangeslider=dict(visible=False),
+                    title=dict(text=f"SPX 1-min · {last:%a %d %b} (ET, delayed)", font=dict(size=12)),
+                    tickformat="%H:%M", nticks=5, gridcolor=C["grid_soft"], ticks="outside",
+                    tickcolor=C["grid"], tickfont=dict(size=11)),
+        yaxis=dict(anchor="x3"),          # strike labels on the far left, beside the price panel
+    )
+
+
 def _add_reference_lines(fig: go.Figure, res: GexResult, lo: float, hi: float,
                          em: ExpectedMove | None = None, em_label: str = "") -> None:
     """
@@ -142,7 +179,7 @@ def _add_reference_lines(fig: go.Figure, res: GexResult, lo: float, hi: float,
         # Shaded band between the 1-sigma edges (clipped to the visible strikes).
         y0, y1 = max(em.low, lo), min(em.high, hi)
         if y0 < y1:
-            fig.add_hrect(y0=y0, y1=y1, fillcolor=C["em_band"], line_width=0, layer="below")
+            _hband(fig, y0, y1, C["em_band"])
         refs += [(em.high, "+1σ", C["em_edge"], "dot", 2), (em.low, "−1σ", C["em_edge"], "dot", 2)]
         # Legend entry for the band (shapes have no legend item of their own).
         fig.add_trace(go.Scatter(
@@ -172,8 +209,13 @@ def gex_strike_chart(
     em: ExpectedMove | None = None,
     em_label: str = "",
     note: str = "",
+    price: pd.DataFrame | None = None,
 ) -> go.Figure:
-    """`em`: optional expected move drawn as a +/-1 sigma band; `note`: one line under the title."""
+    """
+    `em`: optional expected move drawn as a +/-1 sigma band; `note`: line(s) under the title;
+    `price`: optional SPX 1-minute bars (data_fetcher.IntradayBars.bars) drawn as a candle
+    panel on the left, sharing the strike axis.
+    """
     lo, hi = res.spot * (1 - range_pct), res.spot * (1 + range_pct)
     raw = res.by_strike[(res.by_strike["strike"] >= lo) & (res.by_strike["strike"] <= hi)]
     d = _bucket_strikes(raw, bucket)
@@ -218,8 +260,8 @@ def gex_strike_chart(
     if res.gamma_flip is not None and lo < res.gamma_flip < hi:
         above = np.interp(min(res.gamma_flip * 1.01, hi), res.profile_levels, res.profile_values)
         up_col, dn_col = (C["zone_pos"], C["zone_neg"]) if above > 0 else (C["zone_neg"], C["zone_pos"])
-        fig.add_hrect(y0=res.gamma_flip, y1=hi, fillcolor=up_col, line_width=0, layer="below")
-        fig.add_hrect(y0=lo, y1=res.gamma_flip, fillcolor=dn_col, line_width=0, layer="below")
+        _hband(fig, res.gamma_flip, hi, up_col)
+        _hband(fig, lo, res.gamma_flip, dn_col)
 
     # 2) Bars
     for col, name, color in (("call_gex", "Call GEX", C["call"]), ("put_gex", "Put GEX", C["put"])):
@@ -250,7 +292,11 @@ def gex_strike_chart(
             hovertemplate="Strike %{y:,.0f}<br>Net GEX (cumulative): %{customdata}<extra></extra>",
         ))
 
-    # 4) Expected-move band + reference lines (labels as right-margin tags).
+    # 4) Optional SPX price panel on the left, sharing the strike axis.
+    panel = _add_price_panel(fig, price) if price is not None and len(price) else {}
+
+    # 5) Expected-move band + reference lines (labels as right-margin tags). The
+    #    lines span the full width, so they cross the price panel too.
     _add_reference_lines(fig, res, lo, hi, em, em_label)
 
     n_rows = max(len(d), 1)
@@ -277,6 +323,8 @@ def gex_strike_chart(
                    ticks="outside", tickcolor=C["grid"], tickfont=dict(size=12)),
         legend=dict(font=dict(size=13), itemsizing="constant", y=-0.07),
     )
+    if panel:
+        fig.update_layout(**panel)
     return fig
 
 

@@ -2,8 +2,9 @@
 app.py - Streamlit entry point.   Run with:  streamlit run app.py
 
 Local only: .streamlit/config.toml binds the server to localhost and turns
-off Streamlit's usage-statistics telemetry. The only outbound request this app
-makes is the CBOE chain download, and only when you click "Refresh Data".
+off Streamlit's usage-statistics telemetry. The only outbound requests this app
+makes are two CBOE downloads (the option chain and SPX 1-minute price bars),
+and only when you click "Refresh Data".
 """
 
 from __future__ import annotations
@@ -75,6 +76,9 @@ with st.sidebar:
     st.header("Controls")
     show_net = st.toggle("Show Net GEX (cumulative) line", value=True)
     show_agg = st.toggle("Show Aggregate GEX line", value=True)
+    show_price = st.toggle("Show SPX price panel", value=True,
+                           help="SPX 1-minute candles for the latest session, beside the GEX bars on the same "
+                                "strike axis, so price can be read against the walls, flip and ±1σ lines.")
     range_pct = st.slider("Strike range shown (± % of spot)", 1.0, 15.0,
                           config.DEFAULT_STRIKE_RANGE_PCT * 100, step=0.5) / 100.0
     bucket = st.select_slider("Bar width (points per bar)", options=[5, 10, 25, 50],
@@ -121,6 +125,17 @@ if refresh:
             st.session_state.pop("fetch_error", None)
         except data_fetcher.DataFetchError as exc:
             st.session_state["fetch_error"] = str(exc)
+    # Price bars are fetched alongside a successful chain download. A failure here
+    # only hides the price panel; the GEX data is still updated. Old bars are
+    # dropped rather than shown next to a newer chain.
+    if "fetch_error" not in st.session_state:
+        with st.spinner("Downloading SPX 1-minute price bars from CBOE..."):
+            try:
+                st.session_state["intraday"] = data_fetcher.fetch_spx_intraday()
+                st.session_state.pop("intraday_error", None)
+            except data_fetcher.DataFetchError as exc:
+                st.session_state["intraday"] = None
+                st.session_state["intraday_error"] = str(exc)
 
 if err := st.session_state.get("fetch_error"):
     st.error(f"Refresh failed - nothing was updated.\n\n{err}")
@@ -246,16 +261,29 @@ t_strike, t_exp, t_prof, t_cv, t_quality, t_method = st.tabs(
 
 with t_strike:
     title = "SPX Gamma Exposure by Strike - " + ("all expirations" if selected is None else f"{selected:%d %b %Y}")
+    intraday: data_fetcher.IntradayBars | None = st.session_state.get("intraday")
+    price = intraday.bars if (show_price and intraday is not None) else None
+    if show_price and (perr := st.session_state.get("intraday_error")):
+        st.warning("SPX price bars could not be downloaded, so the price panel is hidden "
+                   f"(GEX data was still updated).\n\n{perr}")
     if res_vol is None:
         st.plotly_chart(viz.gex_strike_chart(res, show_net, show_agg, range_pct, title + (" - by volume" if by_vol else ""),
-                                             bucket, em=em, em_label=em_label, note=em_note), width="stretch")
+                                             bucket, em=em, em_label=em_label, note=em_note, price=price),
+                        width="stretch")
     else:
         # Side by side on wide screens; Streamlit stacks columns on narrow ones.
         c_oi, c_vol = st.columns(2)
         for col_, r_, suffix in ((c_oi, res, "by open interest"), (c_vol, res_vol, "by volume")):
             note_ = viz.em_note(em, em_label, r_)
             col_.plotly_chart(viz.gex_strike_chart(r_, show_net, show_agg, range_pct, f"GEX {suffix}", bucket,
-                                                   em=em, em_label=em_label, note=note_), width="stretch")
+                                                   em=em, em_label=em_label, note=note_, price=price),
+                              width="stretch")
+    if price is not None:
+        last = price["time"].iloc[-1]
+        st.caption(f"Price panel: CBOE SPX 1-minute bars for {last:%a %d %b %Y}, last bar {last:%H:%M} ET "
+                   f"(delayed ≥15 min). Levels are the current GEX snapshot drawn across the whole session; "
+                   "walls and flip were not necessarily at these levels earlier in the day. Narrow the strike "
+                   "range in the sidebar to zoom both panels.")
         st.markdown("**Open interest vs today's volume**")
         st.dataframe(viz.comparison_table(res, res_vol), hide_index=True, width="stretch")
     if mode != "oi" and has_volume:
@@ -411,6 +439,9 @@ with t_quality:
     if snap.notes:
         st.info("Parser notes:\n\n" + "\n".join(f"- {n}" for n in snap.notes))
     st.caption(f"Source: {snap.source_url}")
+    if (bars_ := st.session_state.get("intraday")) is not None:
+        st.caption(f"Price bars: {bars_.source_url} · {len(bars_.bars):,} bars · "
+                   f"CBOE file timestamp {bars_.cboe_timestamp or 'n/a'}")
 
 with t_method:
     st.markdown(

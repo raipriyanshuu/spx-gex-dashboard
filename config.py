@@ -26,6 +26,14 @@ CBOE_INTRADAY_URLS = [
 ]
 HTTP_TIMEOUT_SECONDS = 30
 
+# Auto-refresh: re-download on a timer while the page is open. The feed is
+# still delayed >=15 minutes; this only saves clicking. Intervals are kept at
+# one minute or longer because every refresh downloads the whole chain.
+AUTO_REFRESH_DEFAULT = True
+AUTO_REFRESH_INTERVALS = {60: "1 minute", 120: "2 minutes", 300: "5 minutes", 600: "10 minutes"}
+AUTO_REFRESH_DEFAULT_SECONDS = 60
+AUTO_REFRESH_TICK_SECONDS = 5      # how often the page checks whether a refresh is due (no download)
+
 # Option roots we keep. SPX = AM-settled monthlies, SPXW = PM-settled weeklies/dailies.
 ALLOWED_ROOTS = ("SPX", "SPXW")
 
@@ -101,7 +109,8 @@ VOLUME_OI_TOP_N = 15                # rows in the Volume / OI table
 FLIP_SEARCH_RANGE_PCT = 0.20       # search hypothetical spots within +/-20% of spot
 FLIP_GRID_POINTS = 401             # resolution of that search (~0.1% steps)
 DEFAULT_STRIKE_RANGE_PCT = 0.035   # strikes shown on the chart: +/-3.5% of spot
-DEFAULT_STRIKE_BUCKET = 10         # group 5-pt strikes into 10-pt bars on the main chart   # strikes shown on the chart: +/-6% of spot
+DEFAULT_STRIKE_BUCKET = 5          # one bar per 5-pt strike: GEX at every price level
+DEFAULT_CHART_HEIGHT = 1150        # px, main strike charts (sidebar slider)
 DEFAULT_EXPIRIES_IN_BREAKDOWN = 15
 
 # ---------------------------------------------------------------------------

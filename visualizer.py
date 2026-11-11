@@ -134,8 +134,38 @@ def _hband(fig: go.Figure, y0: float, y1: float, color: str) -> None:
                   fillcolor=color, line_width=0, layer="below")
 
 
-PRICE_PANEL_WIDTH = 0.26          # share of the plot width given to the SPX price panel
-PRICE_PANEL_GAP = 0.015
+PRICE_PANEL_WIDTH = 0.58          # share of the plot width given to the SPX price panel
+PRICE_PANEL_GAP = 0.012
+MAX_VALUE_LABEL_ROWS = 110        # above this many bars the per-level value labels would overprint
+
+
+def fit_strike_range(res: GexResult, em: ExpectedMove | None = None, price: pd.DataFrame | None = None,
+                     max_pct: float = config.DEFAULT_STRIKE_RANGE_PCT) -> tuple[float, float]:
+    """
+    Strike range that frames the levels that matter, so the chart needs no
+    zooming: spot, walls, flip, the +/-1 sigma edges and the session's price
+    range, plus some headroom. Never wider than +/-max_pct of spot (levels
+    beyond that are simply off-chart) and never narrower than +/-0.6%.
+    """
+    cap_lo, cap_hi = res.spot * (1 - max_pct), res.spot * (1 + max_pct)
+    levels = [res.spot, res.call_wall, res.put_wall, res.gamma_flip]
+    if em is not None:
+        levels += [em.low, em.high]
+    if price is not None and len(price):
+        levels += [float(price["low"].min()), float(price["high"].max())]
+    levels = [v for v in levels if v is not None and cap_lo <= v <= cap_hi]
+    lo, hi = min(levels), max(levels)
+    pad = max((hi - lo) * 0.22, res.spot * 0.002)
+    lo, hi = min(lo - pad, res.spot * 0.994), max(hi + pad, res.spot * 1.006)
+    return max(lo, cap_lo), min(hi, cap_hi)
+
+
+def _strike_dtick(span: float) -> float:
+    """Smallest round tick step that keeps the strike axis to ~45 labels or fewer."""
+    for step in (5, 10, 25, 50, 100):
+        if span / step <= 45:
+            return step
+    return 250
 
 
 def _add_price_panel(fig: go.Figure, bars: pd.DataFrame) -> dict:
@@ -163,11 +193,12 @@ def _add_price_panel(fig: go.Figure, bars: pd.DataFrame) -> dict:
 
 
 def _add_reference_lines(fig: go.Figure, res: GexResult, lo: float, hi: float,
-                         em: ExpectedMove | None = None, em_label: str = "") -> None:
+                         em: ExpectedMove | None = None, em_label: str = "", x1: float = 1.0) -> None:
     """
     Horizontal reference lines across the plot (Spot, walls, flip), plus the
     optional +/-1 sigma expected-move band, with labels as tags in the right
-    margin. Shared by the GEX chart and the charm/vanna charts.
+    margin. Shared by the GEX chart and the charm/vanna charts. `x1` (paper
+    fraction) is where the lines end; < 1 leaves a clear column at the right.
     """
     refs = [
         (res.call_wall, "Call Wall", C["call"], "solid", 0),
@@ -189,7 +220,7 @@ def _add_reference_lines(fig: go.Figure, res: GexResult, lo: float, hi: float,
     refs = sorted((r for r in refs if r[0] is not None and lo <= r[0] <= hi), key=lambda r: r[0])
     placed = _place_labels([r[0] for r in refs], lo, hi, (hi - lo) * 0.045)
     for (y, name, color, dash, dec), ly in zip(refs, placed):
-        fig.add_shape(type="line", xref="paper", x0=0, x1=1, yref="y", y0=y, y1=y,
+        fig.add_shape(type="line", xref="paper", x0=0, x1=x1, yref="y", y0=y, y1=y,
                       line=dict(color=color, width=2 if dash == "solid" else 1.8, dash=dash), layer="above")
         fig.add_annotation(
             xref="paper", x=1.008, xanchor="left", yref="y", y=ly, yanchor="middle",
@@ -210,15 +241,23 @@ def gex_strike_chart(
     em_label: str = "",
     note: str = "",
     price: pd.DataFrame | None = None,
+    y_range: tuple[float, float] | None = None,
+    height: int | None = None,
+    show_values: bool = False,
 ) -> go.Figure:
     """
     `em`: optional expected move drawn as a +/-1 sigma band; `note`: line(s) under the title;
     `price`: optional SPX 1-minute bars (data_fetcher.IntradayBars.bars) drawn as a candle
-    panel on the left, sharing the strike axis.
+    panel on the left, sharing the strike axis;
+    `y_range`: explicit (low, high) strike range, e.g. from fit_strike_range(); default is
+    +/-range_pct of spot; `height`: figure height in px (default scales with the bar count);
+    `show_values`: print each level's net GEX beside its bar (a "GEX ladder").
     """
-    lo, hi = res.spot * (1 - range_pct), res.spot * (1 + range_pct)
+    lo, hi = y_range or (res.spot * (1 - range_pct), res.spot * (1 + range_pct))
     raw = res.by_strike[(res.by_strike["strike"] >= lo) & (res.by_strike["strike"] <= hi)]
     d = _bucket_strikes(raw, bucket)
+    agg = res.aggregate_at_strikes
+    agg = agg[(agg.index >= lo) & (agg.index <= hi)]      # res may cover a wider range than shown
 
     custom = np.column_stack(
         [
@@ -248,10 +287,17 @@ def gex_strike_chart(
     line_extent = []
     if show_net_line and len(raw):
         line_extent.append(raw["net_gex_cumulative"].to_numpy())
-    if show_agg_line and len(res.aggregate_at_strikes):
-        line_extent.append(res.aggregate_at_strikes.to_numpy())
+    if show_agg_line and len(agg):
+        line_extent.append(agg.to_numpy())
     line_extent = np.concatenate(line_extent) if line_extent else np.array([0.0])
     ldiv, lsuf = _unit(line_extent)
+
+    # Both x-axes share the same proportions around zero so their zero points line
+    # up. With value labels on, extra room on the right holds the label column.
+    show_values = show_values and 0 < len(d) <= MAX_VALUE_LABEL_ROWS
+    bar_m = _sym_range(bar_extent / bdiv, pad=1.08)[1]
+    line_m = _sym_range(line_extent / ldiv, pad=1.08)[1]
+    right = 1.34 if show_values else 1.0
 
     fig = go.Figure()
 
@@ -272,10 +318,19 @@ def gex_strike_chart(
             customdata=custom, hovertemplate=hover,
         ))
 
+    # 2b) GEX ladder: net GEX printed at every level, right-aligned at the panel edge.
+    if show_values:
+        net = d["net_gex"].to_numpy()
+        fig.add_trace(go.Scatter(
+            y=d["strike"], x=np.full(len(d), bar_m * right * 0.995), mode="text",
+            text=[fmt_usd(v) for v in net], textposition="middle left",
+            textfont=dict(size=11, family=FONT, color=[C["call"] if v >= 0 else C["put"] for v in net]),
+            name="Net GEX per level", hoverinfo="skip", showlegend=False, cliponaxis=False,
+        ))
+
     # 3) Lines (top axis). Smoothed, and the aggregate line drawn slightly softer
     #    so it doesn't overpower the bars.
-    if show_agg_line and len(res.aggregate_at_strikes):
-        agg = res.aggregate_at_strikes
+    if show_agg_line and len(agg):
         fig.add_trace(go.Scatter(
             y=agg.index, x=agg.values / ldiv, xaxis="x2", mode="lines",
             name="Aggregate GEX (spot = strike)", opacity=0.9,
@@ -296,11 +351,14 @@ def gex_strike_chart(
     panel = _add_price_panel(fig, price) if price is not None and len(price) else {}
 
     # 5) Expected-move band + reference lines (labels as right-margin tags). The
-    #    lines span the full width, so they cross the price panel too.
-    _add_reference_lines(fig, res, lo, hi, em, em_label)
+    #    lines span both panels, so they cross the price action too; with the value
+    #    ladder on they stop just short of it so the numbers stay readable.
+    gex_x0 = PRICE_PANEL_WIDTH + PRICE_PANEL_GAP if panel else 0.0
+    ladder = (right - 1) / (1 + right)                   # ladder's share of the GEX panel width
+    _add_reference_lines(fig, res, lo, hi, em, em_label, x1=1 - (1 - gex_x0) * ladder * 1.03)
 
     n_rows = max(len(d), 1)
-    height = int(np.clip(n_rows * 17 + 260, 820, 1400))
+    height = height or int(np.clip(n_rows * 17 + 260, 820, 1400))
     _base_layout(fig, height=height)
     fig.update_layout(
         title=dict(text=_title_with_note(title, note), x=0.005, y=0.985, yanchor="top", font=dict(size=18)),
@@ -310,18 +368,19 @@ def gex_strike_chart(
         hovermode="closest",
         font=dict(size=13),
         xaxis=dict(title=dict(text=f"GEX per strike  (${bsuf} per 1% SPX move{by_vol})", font=dict(size=13)),
-                   range=_sym_range(bar_extent / bdiv, pad=1.08), tickformat=",.2~f",
+                   range=[-bar_m, bar_m * right], tickformat=",.2~f",
                    gridcolor=C["grid_soft"], zeroline=True, zerolinecolor=C["muted"], zerolinewidth=1.5,
                    ticks="outside", tickcolor=C["grid"]),
         xaxis2=dict(title=dict(text=f"Net GEX (cumulative) / Aggregate GEX  (${lsuf} per 1% move)",
                                font=dict(color=C["muted"], size=12)),
-                    overlaying="x", side="top", range=_sym_range(line_extent / ldiv, pad=1.08),
+                    overlaying="x", side="top", range=[-line_m, line_m * right],
                     tickmode="auto", nticks=8, tickformat=",.0f", showgrid=False, zeroline=False,
                     tickfont=dict(color=C["muted"])),
         yaxis=dict(title=dict(text="Strike", font=dict(size=13)), range=[lo, hi],
-                   gridcolor=C["grid_soft"], tickformat=",.0f", dtick=25 if (hi - lo) <= 700 else 50,
+                   gridcolor=C["grid_soft"], tickformat=",.0f", dtick=_strike_dtick(hi - lo),
                    ticks="outside", tickcolor=C["grid"], tickfont=dict(size=12)),
-        legend=dict(font=dict(size=13), itemsizing="constant", y=-0.07),
+        # Fixed pixel offset below the plot, so the legend sits right whatever the height.
+        legend=dict(font=dict(size=13), itemsizing="constant", y=-70 / max(height - 230, 1)),
     )
     if panel:
         fig.update_layout(**panel)
@@ -345,6 +404,8 @@ def exposure_strike_chart(
     em: ExpectedMove | None = None,
     em_label: str = "",
     note: str = "",
+    y_range: tuple[float, float] | None = None,
+    height: int | None = None,
 ) -> go.Figure:
     """
     Charm or vanna exposure by strike (exposures.ExposureResult.by_strike), on the
@@ -353,7 +414,7 @@ def exposure_strike_chart(
     """
     pre, name, unit = EXPOSURE_KINDS[kind]
     cols = [f"call_{pre}", f"put_{pre}", f"net_{pre}"]
-    lo, hi = res.spot * (1 - range_pct), res.spot * (1 + range_pct)
+    lo, hi = y_range or (res.spot * (1 - range_pct), res.spot * (1 + range_pct))
     raw = by_strike[(by_strike["strike"] >= lo) & (by_strike["strike"] <= hi)]
     d = _bucket_strikes(raw, bucket, cols)
 
@@ -381,7 +442,7 @@ def exposure_strike_chart(
     ))
     _add_reference_lines(fig, res, lo, hi, em, em_label)
 
-    height = int(np.clip(max(len(d), 1) * 14 + 260, 640, 1100))
+    height = height or int(np.clip(max(len(d), 1) * 14 + 260, 640, 1100))
     _base_layout(fig, height=height)
     fig.update_layout(
         title=dict(text=_title_with_note(title or f"SPX {name} Exposure by Strike", note),
@@ -393,9 +454,9 @@ def exposure_strike_chart(
                    gridcolor=C["grid_soft"], zeroline=True, zerolinecolor=C["muted"], zerolinewidth=1.5,
                    ticks="outside", tickcolor=C["grid"]),
         yaxis=dict(title=dict(text="Strike", font=dict(size=13)), range=[lo, hi],
-                   gridcolor=C["grid_soft"], tickformat=",.0f", dtick=25 if (hi - lo) <= 700 else 50,
+                   gridcolor=C["grid_soft"], tickformat=",.0f", dtick=_strike_dtick(hi - lo),
                    ticks="outside", tickcolor=C["grid"], tickfont=dict(size=12)),
-        legend=dict(font=dict(size=12), itemsizing="constant", y=-0.08),
+        legend=dict(font=dict(size=12), itemsizing="constant", y=-70 / max(height - 190, 1)),
     )
     return fig
 

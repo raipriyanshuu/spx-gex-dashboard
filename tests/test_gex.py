@@ -88,6 +88,19 @@ def intraday_payload():
     return {"timestamp": "2026-10-02 16:15:00", "symbol": "_SPX", "data": bars}
 
 
+class TestAutoRefresh(unittest.TestCase):
+    def test_seconds_until_refresh(self):
+        t0 = datetime(2026, 11, 11, 15, 0, 0, tzinfo=timezone.utc)
+        self.assertEqual(dfh.seconds_until_refresh(None, 60, t0), 0.0)                 # nothing fetched yet: due
+        self.assertEqual(dfh.seconds_until_refresh(t0, 60, t0 + timedelta(seconds=20)), 40.0)
+        self.assertEqual(dfh.seconds_until_refresh(t0, 60, t0 + timedelta(seconds=60)), 0.0)
+        self.assertEqual(dfh.seconds_until_refresh(t0, 60, t0 + timedelta(seconds=500)), 0.0)   # never negative
+
+    def test_intervals_are_at_least_a_minute(self):
+        self.assertGreaterEqual(min(config.AUTO_REFRESH_INTERVALS), 60)
+        self.assertIn(config.AUTO_REFRESH_DEFAULT_SECONDS, config.AUTO_REFRESH_INTERVALS)
+
+
 class TestIntraday(unittest.TestCase):
     def test_parse(self):
         b = dfh.parse_intraday(intraday_payload())
@@ -113,6 +126,47 @@ class TestIntraday(unittest.TestCase):
         self.assertEqual(len(candles), 1)
         self.assertEqual((candles[0].xaxis, candles[0].yaxis), ("x3", "y"))   # shares the strike axis
         self.assertLess(fig.layout.xaxis3.domain[1], fig.layout.xaxis.domain[0])
+
+
+class TestBigChart(unittest.TestCase):
+    def setUp(self):
+        payload, now = synthetic_payload()
+        self.spot, chain, _, _ = dfh.parse_payload(payload)
+        prepared, _ = gc.prepare_chain(chain, self.spot, now=now)
+        self.res = gc.run_analysis(prepared, self.spot, display_range_pct=0.035)
+        self.em = vm.pick(vm.expected_moves(chain, self.spot, now=now), None)
+        self.bars = dfh.parse_intraday(intraday_payload())
+
+    def test_fit_range_frames_key_levels_within_cap(self):
+        lo, hi = viz.fit_strike_range(self.res, self.em, self.bars, max_pct=0.035)
+        self.assertGreaterEqual(lo, self.spot * (1 - 0.035))
+        self.assertLessEqual(hi, self.spot * (1 + 0.035))
+        self.assertLess(lo, self.spot * 0.994 + 1e-9)            # never narrower than +/-0.6%
+        self.assertGreater(hi, self.spot * 1.006 - 1e-9)
+        levels = [self.res.call_wall, self.res.put_wall, self.res.gamma_flip, self.em.low, self.em.high,
+                  self.bars["low"].min(), self.bars["high"].max()]
+        for v in levels:                                         # every level inside the cap is in frame
+            if v is not None and self.spot * 0.965 <= v <= self.spot * 1.035:
+                self.assertTrue(lo < v < hi, v)
+        # a far-away level is ignored rather than stretching the frame past the cap
+        tight = viz.fit_strike_range(self.res, None, None, max_pct=0.01)
+        self.assertGreaterEqual(tight[0], self.spot * 0.99)
+        self.assertLessEqual(tight[1], self.spot * 1.01)
+
+    def test_range_height_and_value_ladder(self):
+        yr = viz.fit_strike_range(self.res, self.em, self.bars, 0.035)
+        fig = viz.gex_strike_chart(self.res, bucket=5, price=self.bars, y_range=yr, height=1300, show_values=True)
+        self.assertEqual(tuple(fig.layout.yaxis.range), yr)
+        self.assertEqual(fig.layout.height, 1300)
+        ladder = [t for t in fig.data if getattr(t, "mode", None) == "text"]
+        self.assertEqual(len(ladder), 1)
+        shown = self.res.by_strike[(self.res.by_strike["strike"] >= yr[0]) & (self.res.by_strike["strike"] <= yr[1])]
+        self.assertEqual(list(ladder[0].text), [viz.fmt_usd(v) for v in shown["net_gex"]])   # one per level
+        # both x-axes keep the same proportions around zero, so their zeros still line up
+        (a0, a1), (b0, b1) = fig.layout.xaxis.range, fig.layout.xaxis2.range
+        self.assertAlmostEqual(a1 / -a0, b1 / -b0, places=9)
+        plain = viz.gex_strike_chart(self.res)
+        self.assertFalse(any(getattr(t, "mode", None) == "text" for t in plain.data))
 
 
 class TestMath(unittest.TestCase):

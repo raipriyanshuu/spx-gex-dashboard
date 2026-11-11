@@ -19,8 +19,8 @@ Caveats you should know:
     changes are not visible anywhere in this feed.
   * CBOE's website terms of use govern this data. Personal, on-demand,
     low-frequency use (what this app does: one chain request plus one price
-    request per click) is the lowest-impact pattern; do not redistribute the
-    data or poll it in a loop.
+    request per click, or per auto-refresh interval of a minute or more) is
+    the lowest-impact pattern; do not redistribute the data or poll it faster.
 
 SPX PRICE BARS (for the price panel beside the GEX chart)
 ---------------------------------------------------------
@@ -186,6 +186,20 @@ def fetch_spx_chain() -> ChainSnapshot:
         source_url=url,
         notes=notes,
     )
+
+
+def seconds_until_refresh(last_attempt_utc: datetime | None, interval_seconds: float,
+                          now_utc: datetime | None = None) -> float:
+    """
+    Auto-refresh pacing: seconds left before the next download is due (0 = due
+    now, including when nothing has been attempted yet). It is measured from the
+    last ATTEMPT, successful or not, so a failing feed is retried once per
+    interval rather than in a tight loop.
+    """
+    if last_attempt_utc is None:
+        return 0.0
+    elapsed = ((now_utc or datetime.now(timezone.utc)) - last_attempt_utc).total_seconds()
+    return max(0.0, interval_seconds - elapsed)
 
 
 @dataclass

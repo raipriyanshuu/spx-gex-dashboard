@@ -4,7 +4,8 @@ app.py - Streamlit entry point.   Run with:  streamlit run app.py
 Local only: .streamlit/config.toml binds the server to localhost and turns
 off Streamlit's usage-statistics telemetry. The only outbound requests this app
 makes are two CBOE downloads (the option chain and SPX 1-minute price bars),
-and only when you click "Refresh Data".
+when you click "Refresh Data" or, with the sidebar's Auto-refresh on, once per
+chosen interval while the page is open.
 """
 
 from __future__ import annotations
@@ -44,7 +45,9 @@ VOLUME_CAVEAT = (
 st.markdown(
     f"""
     <style>
-      .block-container {{ padding-top: 3.2rem; }}
+      /* Use the full browser width so the charts are as large as the screen allows. */
+      .block-container {{ padding-top: 3.2rem; padding-left: 1.5rem; padding-right: 1.5rem;
+                          max-width: 100%; }}
       .card {{ background:{C['panel']}; border:1px solid {C['grid']}; border-radius:10px;
                padding:12px 14px; height:100%; }}
       .card .lbl {{ color:{C['muted']}; font-size:0.78rem; text-transform:uppercase;
@@ -79,6 +82,14 @@ with st.sidebar:
     show_price = st.toggle("Show SPX price panel", value=True,
                            help="SPX 1-minute candles for the latest session, beside the GEX bars on the same "
                                 "strike axis, so price can be read against the walls, flip and ±1σ lines.")
+    show_values = st.toggle("Show GEX value at every level", value=True,
+                            help="Prints each level's net GEX ($ per 1% SPX move) beside its bar, so the "
+                                 "chart can be read without hovering.")
+    chart_height = st.slider("Chart height (px)", 700, 2200, config.DEFAULT_CHART_HEIGHT, step=50)
+    auto_fit = st.toggle("Auto-fit strike range to key levels", value=True,
+                         help="Frames the chart around spot, the walls, the flip, the ±1σ edges and the "
+                              "session's price range, so no zooming is needed. The slider below is then "
+                              "the maximum range. Turn off to show exactly the slider's range.")
     range_pct = st.slider("Strike range shown (± % of spot)", 1.0, 15.0,
                           config.DEFAULT_STRIKE_RANGE_PCT * 100, step=0.5) / 100.0
     bucket = st.select_slider("Bar width (points per bar)", options=[5, 10, 25, 50],
@@ -86,6 +97,16 @@ with st.sidebar:
                               help="Groups SPX's 5-point strikes into wider bars for readability. "
                                    "Walls, flip and totals are always calculated on exact strikes.")
     max_exp = st.slider("Expirations in breakdown chart", 5, 40, config.DEFAULT_EXPIRIES_IN_BREAKDOWN)
+    st.divider()
+    st.subheader("Data")
+    auto_refresh = st.toggle("Auto-refresh", value=config.AUTO_REFRESH_DEFAULT,
+                             help="Re-downloads the chain and price bars from CBOE on a timer while this page "
+                                  "is open. The feed is still delayed ≥15 minutes; this only saves clicking. "
+                                  "Turn off to fetch only when you click Refresh Data.")
+    refresh_every = st.selectbox("Refresh every", options=list(config.AUTO_REFRESH_INTERVALS),
+                                 format_func=lambda s: config.AUTO_REFRESH_INTERVALS[s],
+                                 index=list(config.AUTO_REFRESH_INTERVALS).index(config.AUTO_REFRESH_DEFAULT_SECONDS),
+                                 disabled=not auto_refresh)
     st.divider()
     st.subheader("Model inputs")
     convention = st.selectbox(
@@ -118,7 +139,13 @@ head_l.title("SPX Gamma Exposure")
 refresh = head_r.button("🔄 Refresh Data", type="primary", width="stretch",
                         help="Download a fresh SPX chain from CBOE and recalculate everything.")
 
-if refresh:
+# Auto-refresh is due when the chosen interval has passed since the last download
+# ATTEMPT (so a failing feed is retried once per interval, never in a tight loop).
+auto_due = auto_refresh and data_fetcher.seconds_until_refresh(
+    st.session_state.get("last_attempt_utc"), refresh_every) <= 0
+
+if refresh or auto_due:
+    st.session_state["last_attempt_utc"] = datetime.now(timezone.utc)
     with st.spinner("Downloading SPX option chain from CBOE..."):
         try:
             st.session_state["snapshot"] = data_fetcher.fetch_spx_chain()
@@ -137,13 +164,34 @@ if refresh:
                 st.session_state["intraday"] = None
                 st.session_state["intraday_error"] = str(exc)
 
+
+
+@st.fragment(run_every=config.AUTO_REFRESH_TICK_SECONDS if auto_refresh else None)
+def auto_refresh_status() -> None:
+    """
+    Countdown to the next automatic download. Only this small fragment re-runs on
+    the tick (no download, no recalculation); when the interval is up it triggers
+    one full rerun, and the refresh block above does the actual fetch.
+    """
+    if not auto_refresh:
+        return
+    left = data_fetcher.seconds_until_refresh(st.session_state.get("last_attempt_utc"), refresh_every)
+    if left <= 0:
+        st.rerun()
+    st.markdown(f'<div class="stamp">🔁 Auto-refresh every {config.AUTO_REFRESH_INTERVALS[refresh_every]} · '
+                f"next download in about {left:.0f} s (turn off in the sidebar)</div>", unsafe_allow_html=True)
+
+
+auto_refresh_status()
+
 if err := st.session_state.get("fetch_error"):
-    st.error(f"Refresh failed - nothing was updated.\n\n{err}")
+    st.error("Refresh failed - nothing was updated."
+             + (" Auto-refresh will try again at the next interval." if auto_refresh else "") + f"\n\n{err}")
 
 snap: data_fetcher.ChainSnapshot | None = st.session_state.get("snapshot")
 if snap is None:
     st.info("No data loaded yet. Click **Refresh Data** to download the current SPX chain "
-            "from CBOE (delayed at least 15 minutes). Nothing is fetched until you click.")
+            "from CBOE (delayed at least 15 minutes). With auto-refresh off, nothing is fetched until you click.")
     st.stop()
 
 # Timestamp line: when *you* fetched, what CBOE stamped, and the built-in delay.
@@ -266,9 +314,16 @@ with t_strike:
     if show_price and (perr := st.session_state.get("intraday_error")):
         st.warning("SPX price bars could not be downloaded, so the price panel is hidden "
                    f"(GEX data was still updated).\n\n{perr}")
+
+    def strike_range(r_: gc.GexResult) -> tuple[float, float] | None:
+        """Auto-fit frames the key levels (capped at the slider's range); off = the slider's range."""
+        return viz.fit_strike_range(r_, em, price, range_pct) if auto_fit else None
+
     if res_vol is None:
         st.plotly_chart(viz.gex_strike_chart(res, show_net, show_agg, range_pct, title + (" - by volume" if by_vol else ""),
-                                             bucket, em=em, em_label=em_label, note=em_note, price=price),
+                                             bucket, em=em, em_label=em_label, note=em_note, price=price,
+                                             y_range=strike_range(res), height=chart_height,
+                                             show_values=show_values),
                         width="stretch")
     else:
         # Side by side on wide screens; Streamlit stacks columns on narrow ones.
@@ -276,16 +331,17 @@ with t_strike:
         for col_, r_, suffix in ((c_oi, res, "by open interest"), (c_vol, res_vol, "by volume")):
             note_ = viz.em_note(em, em_label, r_)
             col_.plotly_chart(viz.gex_strike_chart(r_, show_net, show_agg, range_pct, f"GEX {suffix}", bucket,
-                                                   em=em, em_label=em_label, note=note_, price=price),
+                                                   em=em, em_label=em_label, note=note_, price=price,
+                                                   y_range=strike_range(r_), height=chart_height,
+                                                   show_values=show_values),
                               width="stretch")
+        st.markdown("**Open interest vs today's volume**")
+        st.dataframe(viz.comparison_table(res, res_vol), hide_index=True, width="stretch")
     if price is not None:
         last = price["time"].iloc[-1]
         st.caption(f"Price panel: CBOE SPX 1-minute bars for {last:%a %d %b %Y}, last bar {last:%H:%M} ET "
                    f"(delayed ≥15 min). Levels are the current GEX snapshot drawn across the whole session; "
-                   "walls and flip were not necessarily at these levels earlier in the day. Narrow the strike "
-                   "range in the sidebar to zoom both panels.")
-        st.markdown("**Open interest vs today's volume**")
-        st.dataframe(viz.comparison_table(res, res_vol), hide_index=True, width="stretch")
+                   "walls and flip were not necessarily at these levels earlier in the day.")
     if mode != "oi" and has_volume:
         st.caption("ⓘ " + VOLUME_CAVEAT)
 
@@ -385,7 +441,8 @@ with t_cv:
     cv_scope = "all expirations" if selected is None else f"{selected:%d %b %Y}"
     st.plotly_chart(viz.exposure_strike_chart(ex.by_strike, res, "charm", range_pct,
                                               f"SPX Charm Exposure by Strike - {cv_scope}", bucket,
-                                              em=em, em_label=em_label, note=viz.em_note(em, em_label, res)),
+                                              em=em, em_label=em_label, note=viz.em_note(em, em_label, res),
+                                              y_range=strike_range(res), height=chart_height),
                     width="stretch")
     sell_buy = "sell" if ex.net_charm >= 0 else "buy"
     st.markdown(
@@ -401,7 +458,8 @@ with t_cv:
 
     st.plotly_chart(viz.exposure_strike_chart(ex.by_strike, res, "vanna", range_pct,
                                               f"SPX Vanna Exposure by Strike - {cv_scope}", bucket,
-                                              em=em, em_label=em_label, note=viz.em_note(em, em_label, res)),
+                                              em=em, em_label=em_label, note=viz.em_note(em, em_label, res),
+                                              y_range=strike_range(res), height=chart_height),
                     width="stretch")
     st.markdown(
         "**Vanna** is how dealer hedges would shift when implied volatility moves with price unchanged, for "

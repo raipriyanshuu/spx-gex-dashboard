@@ -5,8 +5,8 @@ delayed feed and shows call/put GEX by strike, the Net GEX (cumulative) and
 Aggregate GEX lines, the Call Wall, Put Wall, Gamma Flip and the current gamma
 regime, with SPX's intraday price drawn beside the bars on the same axis. It runs
 on `http://localhost:8501`, and the only requests it sends out are two CBOE
-downloads (the option chain and SPX 1-minute price bars), made only when you
-click **Refresh Data**.
+downloads (the option chain and SPX 1-minute price bars), made when you click
+**Refresh Data** or automatically once per interval while **Auto-refresh** is on.
 
 ```
 spx-gex-dashboard/
@@ -113,24 +113,58 @@ GET https://cdn.cboe.com/api/global/delayed_quotes/charts/intraday/_SPX.json
 ```
 
 It holds 1-minute OHLC bars (US Eastern times) for the latest session, with the
-same delay and caveats as above. It is fetched once per **Refresh Data** click,
-right after the chain. If it fails, the GEX still updates and only the price
+same delay and caveats as above. It is fetched once per refresh (manual or
+automatic), right after the chain. If it fails, the GEX still updates and only the price
 panel is hidden, with a warning.
+
+## Auto-refresh
+
+Sidebar → **Data → Auto-refresh** (on by default) re-downloads the chain and the
+price bars on a timer while the page is open: every 1, 2, 5 or 10 minutes
+(default 1 minute). A line under the title counts down to the next download.
+
+- **This is not real-time data.** CBOE's free feed is delayed at least 15
+  minutes and open interest is published once a day; auto-refresh only saves
+  clicking. True real-time quotes need a broker or paid data API.
+- The first download happens as soon as the page opens. Turn the toggle off to
+  go back to fetching only when you click **Refresh Data**.
+- The timer is measured from the last download *attempt*, so if CBOE is
+  unreachable the app retries once per interval, never in a tight loop.
+- Each refresh downloads the whole chain, which is why the shortest interval is
+  one minute. Close the browser tab to stop it.
+- A refresh redraws the charts, so a manual zoom or pan is reset each time.
 
 ## SPX price panel
 
-The GEX-by-strike chart has a candlestick panel on its left (sidebar toggle
-**Show SPX price panel**, on by default). Both panels share one y-axis, so the
-Spot, Call Wall, Put Wall, gamma flip and ±1σ lines, and the regime shading,
-run straight through the session's price action. You can see at a glance where
-SPX is trading, and has traded today, relative to those levels.
+The GEX-by-strike chart is laid out like a price chart with a profile beside
+it: SPX candles take the larger left panel (sidebar toggle **Show SPX price
+panel**, on by default) and the GEX bars sit on its right. Both share one
+y-axis, so the Spot, Call Wall, Put Wall, gamma flip and ±1σ lines, and the
+regime shading, run straight through the session's price action. You can see
+at a glance where SPX is trading, and has traded today, relative to those levels.
 
 - The levels are the **current** snapshot drawn across the whole session.
   Walls and flip were not necessarily at these levels earlier in the day.
-- The strike-range slider zooms both panels together. Narrow it (e.g. ±1%) to
-  see intraday detail.
 - Showing price beside the levels is for reference; it does not imply the
   levels predict where price goes.
+
+### Reading it without zooming
+
+The page uses the full browser width, and these sidebar controls size the chart:
+
+- **Auto-fit strike range to key levels** (on by default): the strike axis is
+  framed around spot, the walls, the flip, the ±1σ edges and the session's
+  high/low, with some headroom. The **Strike range shown** slider is then the
+  maximum; a level further away than that is left off-chart (the note under
+  the title still gives its value). Turn auto-fit off to show exactly the
+  slider's range.
+- **Chart height (px)**: default 1150; raise it on a tall monitor.
+- **Bar width**: default is now one bar per 5-point strike, so every listed
+  price level has its own bar.
+- **Show GEX value at every level** (on by default): prints each level's net
+  GEX ($ per 1% SPX move) at the right edge of the bars, so values can be read
+  without hovering. It is skipped automatically above 110 bars, where the
+  numbers would overprint; widen the bar width or narrow the range to get it back.
 
 ## Implied volatility
 
